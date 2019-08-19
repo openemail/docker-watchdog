@@ -1,5 +1,6 @@
-# Origianl Author: "André Peters <andre.peters@servercow.de>"
 #!/bin/bash
+
+# Origianl Author: "André Peters <andre.peters@servercow.de>"
 
 trap "exit" INT TERM
 trap "kill 0" EXIT
