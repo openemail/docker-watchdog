@@ -1,14 +1,12 @@
 #!/bin/bash
 
-# Origianl Author: "André Peters <andre.peters@servercow.de>"
-
 trap "exit" INT TERM
 trap "kill 0" EXIT
 
 # Prepare
 BACKGROUND_TASKS=()
 echo "Waiting for containers to settle..."
-sleep 10
+sleep 30
 
 if [[ "${USE_WATCHDOG}" =~ ^([nN][oO]|[nN])+$ ]]; then
   echo -e "$(date) - USE_WATCHDOG=n, skipping watchdog..."
@@ -20,6 +18,17 @@ fi
 if [[ ! -p /tmp/com_pipe ]]; then
   mkfifo /tmp/com_pipe
 fi
+
+# Wait for containers
+while ! mysqladmin status --socket=/var/run/mysqld/mysqld.sock -u${DBUSER} -p${DBPASS} --silent; do
+  echo "Waiting for SQL..."
+  sleep 2
+done
+
+until [[ $(redis-cli -h redis-openemail PING) == "PONG" ]]; do
+  echo "Waiting for Redis..."
+  sleep 2
+done
 
 redis-cli -h redis-openemail DEL F2B_RES > /dev/null
 
@@ -78,7 +87,7 @@ function mail_error() {
       return 1
     fi
     [ -f "/tmp/${1}" ] && BODY="/tmp/${1}"
-    ./smtp-cli --missing-modules-ok \
+    timeout 10s ./smtp-cli --missing-modules-ok \
       --charset=UTF-8 \
       --subject="${SUBJECT}" \
       --body-plain="${BODY}" \
@@ -186,6 +195,31 @@ unbound_checks() {
   return 1
 }
 
+redis_checks() {
+  err_count=0
+  diff_c=0
+  THRESHOLD=5
+  # Reduce error count by 2 after restarting an unhealthy container
+  trap "[ ${err_count} -gt 1 ] && err_count=$(( ${err_count} - 2 ))" USR1
+  while [ ${err_count} -lt ${THRESHOLD} ]; do
+    touch /tmp/redis-openemail; echo "$(tail -50 /tmp/redis-openemail)" > /tmp/redis-openemail
+    host_ip=$(get_container_ip redis-openemail)
+    err_c_cur=${err_count}
+    /usr/lib/nagios/plugins/check_tcp -4 -H redis-openemail -p 6379 -E -s "PING\n" -q "QUIT" -e "PONG" 2>> /tmp/redis-openemail 1>&2; err_count=$(( ${err_count} + $? ))
+    [ ${err_c_cur} -eq ${err_count} ] && [ ! $((${err_count} - 1)) -lt 0 ] && err_count=$((${err_count} - 1)) diff_c=1
+    [ ${err_c_cur} -ne ${err_count} ] && diff_c=$(( ${err_c_cur} - ${err_count} ))
+    progress "Redis" ${THRESHOLD} $(( ${THRESHOLD} - ${err_count} )) ${diff_c}
+    if [[ $? == 10 ]]; then
+      diff_c=0
+      sleep 1
+    else
+      diff_c=0
+      sleep $(( ( RANDOM % 60 ) + 20 ))
+    fi
+  done
+  return 1
+}
+
 mysql_checks() {
   err_count=0
   diff_c=0
@@ -247,7 +281,7 @@ postfix_checks() {
     touch /tmp/postfix-openemail; echo "$(tail -50 /tmp/postfix-openemail)" > /tmp/postfix-openemail
     host_ip=$(get_container_ip postfix-openemail)
     err_c_cur=${err_count}
-    /usr/lib/nagios/plugins/check_smtp -4 -H ${host_ip} -p 589 -f "watchdog@invalid" -C "RCPT TO:null@localhost" -C DATA -C . -R 250 2>> /tmp/postfix-openemail 1>&2; err_count=$(( ${err_count} + $? ))
+    /usr/lib/nagios/plugins/check_smtp -4 -H ${host_ip} -p 589 -f "watchdog@invalid" -C "RCPT TO:watchdog@localhost" -C DATA -C . -R 250 2>> /tmp/postfix-openemail 1>&2; err_count=$(( ${err_count} + $? ))
     /usr/lib/nagios/plugins/check_smtp -4 -H ${host_ip} -p 589 -S 2>> /tmp/postfix-openemail 1>&2; err_count=$(( ${err_count} + $? ))
     [ ${err_c_cur} -eq ${err_count} ] && [ ! $((${err_count} - 1)) -lt 0 ] && err_count=$((${err_count} - 1)) diff_c=1
     [ ${err_c_cur} -ne ${err_count} ] && diff_c=$(( ${err_c_cur} - ${err_count} ))
@@ -266,7 +300,7 @@ postfix_checks() {
 clamd_checks() {
   err_count=0
   diff_c=0
-  THRESHOLD=10
+  THRESHOLD=15
   # Reduce error count by 2 after restarting an unhealthy container
   trap "[ ${err_count} -gt 1 ] && err_count=$(( ${err_count} - 2 ))" USR1
   while [ ${err_count} -lt ${THRESHOLD} ]; do
@@ -386,7 +420,10 @@ fail2ban_checks() {
     array_diff F2B_RES F2B_LOG_STATUS F2B_LOG_STATUS_PREV
     if [[ ! -z "${F2B_RES}" ]]; then
       err_count=$(( ${err_count} + 1 ))
-      echo -n "${F2B_RES[@]}" | redis-cli -x -h redis-openemail SET F2B_RES > /dev/null
+      echo -n "${F2B_RES[@]}" | tr -cd "[a-fA-F0-9.:/] " | timeout 3s redis-cli -x -h redis-openemail SET F2B_RES > /dev/null
+      if [ $? -ne 0 ]; then
+         redis-cli -x -h redis-openemail DEL F2B_RES
+      fi
     fi
     [ ${err_c_cur} -eq ${err_count} ] && [ ! $((${err_count} - 1)) -lt 0 ] && err_count=$((${err_count} - 1)) diff_c=1
     [ ${err_c_cur} -ne ${err_count} ] && diff_c=$(( ${err_c_cur} - ${err_count} ))
@@ -481,7 +518,7 @@ rspamd_checks() {
 From: watchdog@localhost
 
 Empty
-' | usr/bin/curl -s --data-binary @- --unix-socket /var/lib/rspamd/rspamd.sock http://rspamd/scan | jq -rc .required_score)
+' | usr/bin/curl -s --data-binary @- --unix-socket /var/lib/rspamd/rspamd.sock http://rspamd/scan | jq -rc .default.required_score)
     if [[ ${SCORE} != "9999" ]]; then
       echo "Rspamd settings check failed" 2>> /tmp/rspamd-openemail 1>&2
       err_count=$(( ${err_count} + 1))
@@ -512,7 +549,7 @@ olefy_checks() {
     touch /tmp/olefy-openemail; echo "$(tail -50 /tmp/olefy-openemail)" > /tmp/olefy-openemail
     host_ip=$(get_container_ip olefy-openemail)
     err_c_cur=${err_count}
-    /usr/lib/nagios/plugins/check_tcp -4 -H ${host_ip} -p 10055 2>> /tmp/olefy-openemail 1>&2; err_count=$(( ${err_count} + $? ))
+    /usr/lib/nagios/plugins/check_tcp -4 -H ${host_ip} -p 10055 -s "PING\n" 2>> /tmp/olefy-openemail 1>&2; err_count=$(( ${err_count} + $? ))
     [ ${err_c_cur} -eq ${err_count} ] && [ ! $((${err_count} - 1)) -lt 0 ] && err_count=$((${err_count} - 1)) diff_c=1
     [ ${err_c_cur} -ne ${err_count} ] && diff_c=$(( ${err_c_cur} - ${err_count} ))
     progress "Olefy" ${THRESHOLD} $(( ${THRESHOLD} - ${err_count} )) ${diff_c}
@@ -528,18 +565,11 @@ olefy_checks() {
 }
 
 # Notify about start
-if [[ ! -z ${WATCHDOG_NOTIFY_EMAIL} ]] && [[ ! -f /tmp/watchdog_reload ]]; then
+if [[ ! -z ${WATCHDOG_NOTIFY_EMAIL} ]]; then
   mail_error "watchdog-openemail" "Watchdog started monitoring openemail."
-  rm /tmp/watchdog_reload
 fi
 
 # Create watchdog agents
-(
-  touch /tmp/watchdog_reload
-  sleep 86400
-  echo "Reloading watchdog"
-  kill 1
-) &
 
 (
 while true; do
@@ -563,6 +593,18 @@ done
 ) &
 PID=$!
 echo "Spawned mysql_checks with PID ${PID}"
+BACKGROUND_TASKS+=(${PID})
+
+(
+while true; do
+  if ! redis_checks; then
+    log_msg "Redis hit error limit"
+    echo redis-openemail > /tmp/com_pipe
+  fi
+done
+) &
+PID=$!
+echo "Spawned redis_checks with PID ${PID}"
 BACKGROUND_TASKS+=(${PID})
 
 (
@@ -677,17 +719,17 @@ PID=$!
 echo "Spawned fail2ban_checks with PID ${PID}"
 BACKGROUND_TASKS+=(${PID})
 
-#(
-#while true; do
-#  if ! olefy_checks; then
-#    log_msg "Olefy hit error limit"
-#    echo olefy-openemail > /tmp/com_pipe
-#  fi
-#done
-#) &
-#PID=$!
-#echo "Spawned olefy_checks with PID ${PID}"
-#BACKGROUND_TASKS+=(${PID})
+(
+while true; do
+  if ! olefy_checks; then
+    log_msg "Olefy hit error limit"
+    echo olefy-openemail > /tmp/com_pipe
+  fi
+done
+) &
+PID=$!
+echo "Spawned olefy_checks with PID ${PID}"
+BACKGROUND_TASKS+=(${PID})
 
 (
 while true; do
@@ -757,16 +799,17 @@ while true; do
     log_msg "acme-openemail did not complete successfully"
     [[ ! -z ${WATCHDOG_NOTIFY_EMAIL} ]] && mail_error "${com_pipe_answer}" "Please check acme-openemail for further information."
   elif [[ ${com_pipe_answer} == "fail2ban" ]]; then
-    F2B_RES=($(redis-cli -h redis-openemail --raw GET F2B_RES))
-    redis-cli -h redis-openemail DEL F2B_RES > /dev/null
-    host=
-    for host in "${F2B_RES[@]}"; do
-      log_msg "Banned ${host}"
-      rm /tmp/fail2ban 2> /dev/null
-      timeout 2s whois ${host} > /tmp/fail2ban
-      sleep 2.5
-      [[ ! -z ${WATCHDOG_NOTIFY_EMAIL} ]] && [[ ${WATCHDOG_NOTIFY_BAN} =~ ^([yY][eE][sS]|[yY])+$ ]] && mail_error "${com_pipe_answer}" "IP ban: ${host}"
-    done
+    F2B_RES=($(timeout 4s redis-cli -h redis-openemail --raw GET F2B_RES 2> /dev/null))
+    if [[ ! -z "${F2B_RES}" ]]; then
+      redis-cli -h redis-openemail DEL F2B_RES > /dev/null
+      host=
+      for host in "${F2B_RES[@]}"; do
+        log_msg "Banned ${host}"
+        rm /tmp/fail2ban 2> /dev/null
+        timeout 2s whois "${host}" > /tmp/fail2ban
+        [[ ! -z ${WATCHDOG_NOTIFY_EMAIL} ]] && [[ ${WATCHDOG_NOTIFY_BAN} =~ ^([yY][eE][sS]|[yY])+$ ]] && mail_error "${com_pipe_answer}" "IP ban: ${host}"
+      done
+    fi
   elif [[ ${com_pipe_answer} =~ .+-openemail ]]; then
     kill -STOP ${BACKGROUND_TASKS[*]}
     sleep 10
