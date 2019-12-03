@@ -1,5 +1,5 @@
 FROM alpine:3.10
-LABEL maintainer "Chintaka Deshapriya <chinthaka@cybergate.lk>"
+LABEL maintainer "André Peters <andre.peters@servercow.de>"
 
 # Installation
 RUN apk add --update \
