@@ -1,5 +1,5 @@
 FROM alpine:3.10
-LABEL maintainer "André Peters <andre.peters@servercow.de>"
+LABEL maintainer "Amila Kothalawala <amila@openemail.io>"
 
 # Installation
 RUN apk add --update \
